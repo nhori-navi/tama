@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ビー玉コース</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;background:#3b2a1a;font-family:sans-serif;-webkit-user-select:none;user-select:none}
+#app{display:flex;flex-direction:column;height:100%;height:100dvh}
+#bar{background:#2a1d12;color:#fff;padding:4px 6px;min-height:86px}
+#bar button,#bar select{font-size:14px;padding:6px 8px;margin:2px;border-radius:6px;border:1px solid #886;background:#f4ead8;color:#222}
+#bar button.on{background:#ffb347;border-color:#c60;font-weight:bold}
+#bar .go{background:#2e8b57;color:#fff;border-color:#1c5;font-weight:bold}
+#hud{font-size:18px;font-weight:bold;margin:4px 2px}
+#stage{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+canvas{touch-action:none;display:block}
+#msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(255,255,255,.96);border-radius:12px;padding:14px 16px;text-align:center;font-size:17px;line-height:1.6;display:none;width:85%;max-width:360px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+#msg button{font-size:16px;padding:8px 12px;margin:10px 4px 0;border-radius:8px;border:1px solid #886;background:#f4ead8}
+#toast{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(0,0,0,.78);color:#fff;padding:8px 12px;border-radius:8px;font-size:14px;display:none;max-width:90%;text-align:center}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <div id="drawBar">
+      <select id="pen"><option value="6">ペン 細</option><option value="12" selected>ペン 中</option><option value="20">ペン 太</option></select><button id="eraser">消しゴム</button><button id="undoBtn">戻す</button><button id="clearBtn">全消し</button><button id="sampleBtn">見本</button><br>
+      <button id="startBtn">スタート</button><button id="goalBtn">ゴール</button><select id="level"><option value="easy">やさしい</option><option value="normal" selected>ふつう</option><option value="hard">むずかしい</option></select><button id="playBtn" class="go">遊ぶ ▶</button>
+    </div>
+    <div id="playBar" class="hide">
+      <div id="hud">0.0秒</div>
+      <button id="calibBtn">水平リセット</button><button id="retryBtn">最初から</button><button id="shuffleBtn">配置替え</button><button id="backBtn">描く画面へ</button>
+    </div>
+  </div>
+  <div id="stage"><canvas id="cv"></canvas><div id="msg"></div><div id="toast"></div></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const DPR = Math.min(window.devicePixelRatio || 1, 3), G = 4, D2R = Math.PI / 180;
+// 難易度ごとの設定（r＝玉の半径、pits＝落とし穴、blocks＝動かない障害物、bars＝動くバー）
+const LEVELS = {
+  easy:   {name: 'やさしい',   r: 8,  pits: 0, blocks: 0, bars: 0},
+  normal: {name: 'ふつう',     r: 11, pits: 4, blocks: 3, bars: 0},
+  hard:   {name: 'むずかしい', r: 14, pits: 8, blocks: 4, bars: 2}
+};
+let W = 0, H = 0, S = 1, cols = 0, rows = 0, view, viewCtx, mask, maskCtx;
+let strokes = [], cur = null, tool = 'pen', start = null, goal = null, mode = 'draw';
+let baseGrid = null, grid = null, lv = null, lvKey = '', geo = null;
+let ball = null, pits = [], blocks = [], bars = [], holeList = [];
+let state = 'idle', elapsed = 0, falls = 0, anim = 0, dropAt = null, barT = 0, best = {};
+let tilt = {b: 0, g: 0, ok: false}, zero = {b: 0, g: 0}, needZero = false, keys = {x: 0, y: 0};
+let lastHit = 0, lastT = 0, paused = false, wakeLock = null, toastTm = null;
+
+// ---------- 共通 ----------
+function toast(t) {
+  const el = $('toast'); el.textContent = t; el.style.display = 'block';
+  clearTimeout(toastTm); toastTm = setTimeout(() => el.style.display = 'none', 3500);
+}
+function showMsg(html, btns) {
+  const m = $('msg'); m.innerHTML = '<div>' + html + '</div>';
+  btns.forEach(([label, fn]) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => fn(); m.appendChild(b); });
+  m.style.display = 'block';
+}
+function hideMsg() { $('msg').style.display = 'none'; }
+function vib(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+async function keepAwake() { try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => { if (mode === 'play' && document.visibilityState === 'visible') keepAwake(); });
+const cl = v => Math.max(-60, Math.min(60, v));
+
+// ---------- 画面の準備 ----------
+function setup() {
+  const st = $('stage').getBoundingClientRect();
+  W = Math.floor(st.width / G) * G; H = Math.floor(st.height / G) * G;
+  S = Math.min(W, H) / 400; cols = W / G; rows = H / G;
+  cv.width = W * DPR; cv.height = H * DPR;
+  view = document.createElement('canvas'); view.width = W * DPR; view.height = H * DPR; viewCtx = view.getContext('2d');
+  mask = document.createElement('canvas'); mask.width = W; mask.height = H; maskCtx = mask.getContext('2d', {willReadFrequently: true});
+  fit(); loadSample();
+  toast('見本のコースが入っています。「全消し」で自分のコースを描けます');
+}
+function fit() {
+  if (!W) return;
+  const st = $('stage').getBoundingClientRect(), k = Math.min(st.width / W, st.height / H);
+  cv.style.width = W * k + 'px'; cv.style.height = H * k + 'px';
+}
+window.addEventListener('resize', fit);
+
+// ---------- 壁を描く ----------
+function strokeOn(c, s, k, from) {
+  c.save(); c.scale(k, k);
+  c.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';
+  c.strokeStyle = c.fillStyle = '#5a3a1e'; c.lineWidth = s.w; c.lineCap = 'round'; c.lineJoin = 'round';
+  const p = s.pts;
+  if (p.length === 1) { c.beginPath(); c.arc(p[0][0], p[0][1], s.w / 2, 0, 7); c.fill(); }
+  else {
+    const i0 = Math.max(0, from - 1); c.beginPath(); c.moveTo(p[i0][0], p[i0][1]);
+    for (let i = i0 + 1; i < p.length; i++) c.lineTo(p[i][0], p[i][1]);
+    c.stroke();
+  }
+  c.restore();
+}
+function renderWalls() {
+  viewCtx.clearRect(0, 0, view.width, view.height); maskCtx.clearRect(0, 0, W, H);
+  strokes.forEach(s => { strokeOn(viewCtx, s, DPR, 0); strokeOn(maskCtx, s, 1, 0); });
+}
+function loadSample() {
+  const w = 12 * S, L = (x1, y1, x2, y2) => ({w, erase: false, pts: [[x1 * W, y1 * H], [x2 * W, y2 * H]]});
+  strokes = [L(0, .22, .72, .22), L(.28, .42, 1, .42), L(0, .62, .72, .62), L(.28, .82, 1, .82)];
+  start = {x: .12 * W, y: .1 * H}; goal = {x: .85 * W, y: .92 * H};
+  renderWalls(); best = {};
+}
+function toXY(e) { const b = cv.getBoundingClientRect(); return [(e.clientX - b.left) * W / b.width, (e.clientY - b.top) * H / b.height]; }
+cv.addEventListener('pointerdown', e => {
+  if (mode !== 'draw') return;
+  const [x, y] = toXY(e);
+  if (tool === 'start' || tool === 'goal') {
+    if (tool === 'start') start = {x, y}; else goal = {x, y};
+    best = {}; setTool('pen'); return;
+  }
+  cv.setPointerCapture(e.pointerId);
+  cur = {w: (tool === 'eraser' ? 26 : Number($('pen').value)) * S, erase: tool === 'eraser', pts: [[x, y]]};
+  strokes.push(cur); best = {};
+  strokeOn(viewCtx, cur, DPR, 0); strokeOn(maskCtx, cur, 1, 0);
+});
+cv.addEventListener('pointermove', e => {
+  if (!cur) return;
+  const [x, y] = toXY(e), p = cur.pts[cur.pts.length - 1];
+  if (Math.hypot(x - p[0], y - p[1]) < 2) return;
+  cur.pts.push([x, y]); const n = cur.pts.length - 1;
+  strokeOn(viewCtx, cur, DPR, n); strokeOn(maskCtx, cur, 1, n);
+});
+cv.addEventListener('pointerup', () => cur = null);
+cv.addEventListener('pointercancel', () => cur = null);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+function setTool(t) {
+  tool = t;
+  $('eraser').classList.toggle('on', t === 'eraser');
+  $('startBtn').classList.toggle('on', t === 'start');
+  $('goalBtn').classList.toggle('on', t === 'goal');
+}
+$('pen').onchange = () => setTool('pen');
+$('eraser').onclick = () => setTool(tool === 'eraser' ? 'pen' : 'eraser');
+$('startBtn').onclick = () => { setTool(tool === 'start' ? 'pen' : 'start'); if (tool === 'start') toast('スタートの位置をタップしてください'); };
+$('goalBtn').onclick = () => { setTool(tool === 'goal' ? 'pen' : 'goal'); if (tool === 'goal') toast('ゴールの位置をタップしてください'); };
+$('undoBtn').onclick = () => { strokes.pop(); renderWalls(); best = {}; };
+$('clearBtn').onclick = () => { if (confirm('描いた線を全部消しますか？')) { strokes = []; renderWalls(); best = {}; } };
+$('sampleBtn').onclick = () => { if (!strokes.length || confirm('見本のコースに置き換えますか？')) loadSample(); };
+
+// ---------- 当たり判定のマス目 ----------
+function buildGrid() {
+  const d = maskCtx.getImageData(0, 0, W, H).data, g = new Uint8Array(cols * rows);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++)
+    if (d[(y * W + x) * 4 + 3] > 100) g[(y / G | 0) * cols + (x / G | 0)] = 1;
+  return g;
+}
+function isWall(i, j) { return i < 0 || j < 0 || i >= cols || j >= rows || grid[j * cols + i] === 1; }
+function stamp(g, x, y, w, h) {
+  const i0 = Math.max(0, Math.floor(x / G)), i1 = Math.min(cols - 1, Math.floor((x + w) / G));
+  const j0 = Math.max(0, Math.floor(y / G)), j1 = Math.min(rows - 1, Math.floor((y + h) / G));
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) g[j * cols + i] = 1;
+  return {x: i0 * G, y: j0 * G, w: (i1 - i0 + 1) * G, h: (j1 - j0 + 1) * G};
+}
+// 玉の中心が置けないマス（壁に近い・落とし穴の上）
+function blockedMap(g, r, P, pitR) {
+  const b = new Uint8Array(cols * rows), k = Math.ceil((r + G) / G), lim = (r + G * .75) ** 2, offs = [];
+  for (let dj = -k; dj <= k; dj++) for (let di = -k; di <= k; di++) if ((di * G) ** 2 + (dj * G) ** 2 <= lim) offs.push([di, dj]);
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const idx = j * cols + i;
+    if (!g[idx]) continue;
+    if (i > 0 && i < cols - 1 && j > 0 && j < rows - 1 && g[idx - 1] && g[idx + 1] && g[idx - cols] && g[idx + cols]) { b[idx] = 1; continue; }
+    for (const [di, dj] of offs) { const ii = i + di, jj = j + dj; if (ii >= 0 && jj >= 0 && ii < cols && jj < rows) b[jj * cols + ii] = 1; }
+  }
+  const pr2 = (pitR + G * .75) ** 2;
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const x = (i + .5) * G, y = (j + .5) * G;
+    if (x < r || y < r || x > W - r || y > H - r || P.some(p => (x - p.x) ** 2 + (y - p.y) ** 2 < pr2)) b[j * cols + i] = 1;
+  }
+  return b;
+}
+function cellOf(p) {
+  const i = Math.min(cols - 1, Math.max(0, p.x / G | 0)), j = Math.min(rows - 1, Math.max(0, p.y / G | 0));
+  return j * cols + i;
+}
+// スタートから玉が行けるマスを順に塗っていく
+function reach(b, p) {
+  const s = cellOf(p); if (b[s]) return null;
+  const seen = new Uint8Array(cols * rows), list = [s]; seen[s] = 1;
+  const add = n => { if (!seen[n] && !b[n]) { seen[n] = 1; list.push(n); } };
+  for (let k = 0; k < list.length; k++) {
+    const c = list[k], i = c % cols;
+    if (i > 0) add(c - 1); if (i < cols - 1) add(c + 1);
+    if (c >= cols) add(c - cols); if (c < cols * (rows - 1)) add(c + cols);
+  }
+  return {list};
+}
+function canGoal(rc, gR) {
+  if (!rc) return false;
+  const R2 = (gR * .65) ** 2;
+  return rc.list.some(c => ((c % cols + .5) * G - goal.x) ** 2 + (((c / cols | 0) + .5) * G - goal.y) ** 2 < R2);
+}
+
+// ---------- 落とし穴・障害物の配置 ----------
+function layout() {
+  const r = lv.r * S, pitR = r * 1.3, gR = r * 1.45, s = r * 2.2;
+  geo = {r, pitR, gR}; grid = baseGrid; pits = []; blocks = []; bars = [];
+  const rc0 = reach(blockedMap(baseGrid, r, [], 0), start);
+  if (!rc0) return 'スタートが壁や画面の端に近すぎます。少し離して置き直してください。';
+  if (!canGoal(rc0, gR)) return lv.r > LEVELS.easy.r
+    ? 'この難易度の玉の大きさでは、ゴールまで通れません。道を広くするか、難易度を下げてください。'
+    : '玉がゴールまで通れません。道がふさがっていないか、狭すぎないか確認してください。';
+  const cand = rc0.list, at = c => ({x: (c % cols + .5) * G, y: ((c / cols | 0) + .5) * G});
+  const far = (p, q, d) => (p.x - q.x) ** 2 + (p.y - q.y) ** 2 > d * d;
+  let np = lv.pits, nb = lv.blocks, done = false;
+  for (let t = 0; t < 60 && !done; t++) {
+    if (t && t % 15 === 0) { np = Math.max(0, np - 1); nb = Math.max(0, nb - 1); }
+    const g = baseGrid.slice(), P = [], B = [];
+    for (let n = 0; n < 300 && P.length < np; n++) {
+      const p = at(cand[Math.random() * cand.length | 0]);
+      if (far(p, start, pitR + r * 4) && far(p, goal, pitR + gR + r * 2) && P.every(q => far(p, q, pitR * 2 + r * 2.5))) P.push(p);
+    }
+    for (let n = 0; n < 300 && B.length < nb; n++) {
+      const p = at(cand[Math.random() * cand.length | 0]);
+      if (far(p, start, s + r * 3) && far(p, goal, s + gR + r) && P.every(q => far(p, q, s + pitR)) && B.every(q => far(q.c, p, s * 2))) B.push({c: p});
+    }
+    B.forEach(b => Object.assign(b, stamp(g, b.c.x - s / 2, b.c.y - s / 2, s, s)));
+    if (np + nb === 0 || canGoal(reach(blockedMap(g, r, P, pitR), start), gR)) { grid = g; pits = P; blocks = B; done = true; }
+  }
+  holeList = pits.map(p => ({x: p.x, y: p.y, R: pitR})).concat([{x: goal.x, y: goal.y, R: gR, goal: true}]);
+  placeBars(cand, r, pitR, gR);
+  return null;
+}
+function placeBars(cand, r, pitR, gR) {
+  const m = r * 2 + 6, bl = r * 2.6, bt = r * 1.1;
+  for (let n = 0; n < 300 && bars.length < lv.bars; n++) {
+    const c = cand[Math.random() * cand.length | 0], cx = (c % cols + .5) * G, cy = ((c / cols | 0) + .5) * G;
+    const axis = Math.random() < .5 ? 'x' : 'y', w = axis === 'x' ? bt : bl, h = axis === 'x' ? bl : bt;
+    for (let L = r * 7; L >= r * 3; L -= r) {
+      const zone = axis === 'x' ? {x: cx - L - w / 2, y: cy - h / 2, w: 2 * L + w, h} : {x: cx - w / 2, y: cy - L - h / 2, w, h: 2 * L + h};
+      if (!zoneFree(zone, m, pitR, gR, r)) continue;
+      bars.push({axis, cx, cy, L, w, h, x: 0, y: 0, vx: 0, vy: 0, zone, om: 90 * S / L, ph: Math.random() * 6.28});
+      break;
+    }
+  }
+}
+// バーが動く範囲（＋余白）に壁・穴・スタート・ゴール・他のバーがないか
+function zoneFree(z, m, pitR, gR, r) {
+  const x0 = z.x - m, y0 = z.y - m, x1 = z.x + z.w + m, y1 = z.y + z.h + m;
+  if (x0 < 0 || y0 < 0 || x1 > W || y1 > H) return false;
+  for (let j = Math.floor(y0 / G); j <= Math.floor(y1 / G); j++)
+    for (let i = Math.floor(x0 / G); i <= Math.floor(x1 / G); i++) if (isWall(i, j)) return false;
+  const hit = (p, R) => p.x > x0 - R && p.x < x1 + R && p.y > y0 - R && p.y < y1 + R;
+  if (pits.some(p => hit(p, pitR)) || hit(start, r) || hit(goal, gR)) return false;
+  return !bars.some(b => !(x1 < b.zone.x || x0 > b.zone.x + b.zone.w || y1 < b.zone.y || y0 > b.zone.y + b.zone.h));
+}
+function moveBars(h) {
+  barT += h;
+  for (const b of bars) {
+    const a = b.om * barT + b.ph, off = b.L * Math.sin(a), v = b.L * b.om * Math.cos(a);
+    if (b.axis === 'x') { b.x = b.cx + off - b.w / 2; b.y = b.cy - b.h / 2; b.vx = v; b.vy = 0; }
+    else { b.x = b.cx - b.w / 2; b.y = b.cy + off - b.h / 2; b.vx = 0; b.vy = v; }
+  }
+}
+
+// ---------- 玉の動き ----------
+function bounce(nx, ny, ux, uy, e) {
+  const vn = (ball.vx - ux) * nx + (ball.vy - uy) * ny;
+  if (vn >= 0) return;
+  const ee = -vn < 40 * S ? 0 : e;
+  ball.vx -= (1 + ee) * vn * nx; ball.vy -= (1 + ee) * vn * ny;
+  if (-vn > 120 * S && performance.now() - lastHit > 80) {
+    lastHit = performance.now(); vib(Math.round(Math.min(40, Math.max(10, -vn / (15 * S)))));
+  }
+}
+function collideWalls() {
+  const r = ball.r;
+  for (let it = 0; it < 4; it++) {
+    let best2 = 0, nx = 0, ny = 0;
+    const i0 = Math.floor((ball.x - r) / G), i1 = Math.floor((ball.x + r) / G);
+    const j0 = Math.floor((ball.y - r) / G), j1 = Math.floor((ball.y + r) / G);
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      if (!isWall(i, j)) continue;
+      const qx = Math.max(i * G, Math.min(ball.x, i * G + G)), qy = Math.max(j * G, Math.min(ball.y, j * G + G));
+      let dx = ball.x - qx, dy = ball.y - qy, d = Math.hypot(dx, dy), pen;
+      if (d < 1e-6) { dx = ball.x - (i * G + G / 2); dy = ball.y - (j * G + G / 2); d = Math.hypot(dx, dy) || 1; pen = r; }
+      else pen = r - d;
+      if (pen > best2) { best2 = pen; nx = dx / d; ny = dy / d; }
+    }
+    if (best2 <= 0) break;
+    ball.x += nx * best2; ball.y += ny * best2;
+    bounce(nx, ny, 0, 0, .35);
+  }
+}
+function collideBars() {
+  const r = ball.r;
+  for (const b of bars) {
+    const qx = Math.max(b.x, Math.min(ball.x, b.x + b.w)), qy = Math.max(b.y, Math.min(ball.y, b.y + b.h));
+    const dx = ball.x - qx, dy = ball.y - qy, d = Math.hypot(dx, dy);
+    if (d >= r) continue;
+    let nx = 0, ny = 0;
+    if (d < 1e-6) {
+      if (b.axis === 'x') { nx = ball.x < b.x + b.w / 2 ? -1 : 1; ball.x = nx < 0 ? b.x - r : b.x + b.w + r; }
+      else { ny = ball.y < b.y + b.h / 2 ? -1 : 1; ball.y = ny < 0 ? b.y - r : b.y + b.h + r; }
+    } else { nx = dx / d; ny = dy / d; ball.x += nx * (r - d); ball.y += ny * (r - d); }
+    bounce(nx, ny, b.vx, b.vy, .5);
+  }
+}
+// 穴の近くでは中心へ引き込まれ、真ん中付近まで来たら落ちる
+function holes(h) {
+  const A = 1800 * S;
+  for (const p of holeList) {
+    const dx = p.x - ball.x, dy = p.y - ball.y, d = Math.hypot(dx, dy);
+    if (d >= p.R) continue;
+    if (d < p.R * .65) { drop(p); return true; }
+    const k = A * .9 * (1 - d / p.R) * h / d;
+    ball.vx += dx * k; ball.vy += dy * k;
+  }
+  return false;
+}
+function drop(p) {
+  state = p.goal ? 'goalIn' : 'falling'; anim = 0; dropAt = p;
+  if (!p.goal) falls++;
+  vib(p.goal ? [60, 40, 160] : 200);
+}
+function physics(dt) {
+  const A = 1800 * S;
+  let ax = keys.x * .35, ay = keys.y * .35;
+  if (tilt.ok) { ax += Math.sin(cl(tilt.g - zero.g) * D2R); ay += Math.sin(cl(tilt.b - zero.b) * D2R); }
+  const sp = Math.hypot(ball.vx, ball.vy), n = Math.min(24, Math.max(1, Math.ceil(sp * dt / (G * .5)))), h = dt / n;
+  for (let k = 0; k < n; k++) {
+    moveBars(h);
+    ball.vx += ax * A * h; ball.vy += ay * A * h;
+    const f = Math.exp(-.9 * h); ball.vx *= f; ball.vy *= f;
+    const v = Math.hypot(ball.vx, ball.vy), vmax = 1100 * S;
+    if (v > vmax) { ball.vx *= vmax / v; ball.vy *= vmax / v; }
+    ball.x += ball.vx * h; ball.y += ball.vy * h;
+    collideWalls(); collideBars();
+    if (holes(h)) return;
+  }
+}
+
+// ---------- 傾き・キー操作 ----------
+window.addEventListener('deviceorientation', e => {
+  if (e.beta == null || e.gamma == null) return;
+  tilt.b = e.beta; tilt.g = e.gamma; tilt.ok = true;
+  if (needZero) { zero = {b: e.beta, g: e.gamma}; needZero = false; }
+});
+const KEYMAP = {ArrowLeft: ['x', -1], ArrowRight: ['x', 1], ArrowUp: ['y', -1], ArrowDown: ['y', 1]};
+addEventListener('keydown', e => { const k = KEYMAP[e.key]; if (k) { keys[k[0]] = k[1]; e.preventDefault(); } });
+addEventListener('keyup', e => { const k = KEYMAP[e.key]; if (k && keys[k[0]] === k[1]) keys[k[0]] = 0; });
+
+// ---------- 遊ぶ ----------
+async function play() {
+  if (!start || !goal) { toast('「スタート」と「ゴール」を置いてください'); return; }
+  try { if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) await DeviceOrientationEvent.requestPermission(); } catch (e) {}
+  lvKey = $('level').value; lv = LEVELS[lvKey];
+  baseGrid = buildGrid();
+  const err = layout();
+  if (err) { showMsg(err, [['OK', hideMsg]]); return; }
+  mode = 'play'; setTool('pen');
+  $('drawBar').classList.add('hide'); $('playBar').classList.remove('hide'); requestAnimationFrame(fit);
+  if (tilt.ok) zero = {b: tilt.b, g: tilt.g}; else needZero = true;
+  resetRun(); keepAwake();
+  setTimeout(() => { if (mode === 'play' && !tilt.ok) toast('傾きセンサーが反応しません。パソコンでは矢印キーで動かせます'); }, 2500);
+}
+function newBall() { return {x: start.x, y: start.y, vx: 0, vy: 0, r: geo.r, sc: 1}; }
+function resetRun() { ball = newBall(); elapsed = 0; falls = 0; state = 'play'; barT = 0; moveBars(0); hideMsg(); }
+function shuffle() {
+  layout(); resetRun();
+  if (lv.pits + lv.blocks + lv.bars) toast('落とし穴と障害物の配置を変えました');
+}
+function finish() {
+  state = 'done';
+  const prev = best[lvKey], first = prev === undefined, nb = first || elapsed < prev;
+  if (nb) best[lvKey] = elapsed;
+  const note = first ? '' : nb ? '<br><b>自己ベスト更新！</b>' : `<br>自己ベスト ${prev.toFixed(1)}秒`;
+  showMsg(`<div style="font-size:24px;font-weight:bold">ゴール！</div>タイム ${elapsed.toFixed(1)}秒（落ちた${falls}回）${note}`,
+    [['もう一度', resetRun], ['配置替え', shuffle], ['描く画面へ', backToDraw]]);
+}
+function backToDraw() {
+  mode = 'draw'; state = 'idle'; hideMsg();
+  $('playBar').classList.add('hide'); $('drawBar').classList.remove('hide'); requestAnimationFrame(fit);
+  try { if (wakeLock) wakeLock.release(); } catch (e) {}
+  wakeLock = null;
+}
+$('playBtn').onclick = play;
+$('calibBtn').onclick = () => { if (tilt.ok) { zero = {b: tilt.b, g: tilt.g}; toast('いまの傾きを水平にしました'); } };
+$('retryBtn').onclick = () => resetRun();
+$('shuffleBtn').onclick = () => shuffle();
+$('backBtn').onclick = () => backToDraw();
+
+// ---------- 描画 ----------
+function hole(x, y, R, rim) {
+  const g = ctx.createRadialGradient(x, y, R * .2, x, y, R);
+  g.addColorStop(0, '#000'); g.addColorStop(.8, '#1a120a'); g.addColorStop(1, '#4a3622');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, R, 0, 7); ctx.fill();
+  if (rim) { ctx.strokeStyle = rim; ctx.lineWidth = 3; ctx.stroke(); }
+}
+function label(t, x, y, c) {
+  ctx.fillStyle = c; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(t, x, Math.max(10, y));
+}
+function drawBall() {
+  const r = ball.r * ball.sc; if (r <= .3) return;
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.arc(ball.x + r * .25, ball.y + r * .3, r, 0, 7); ctx.fill();
+  const g = ctx.createRadialGradient(ball.x - r * .35, ball.y - r * .4, r * .1, ball.x, ball.y, r);
+  g.addColorStop(0, '#fff'); g.addColorStop(.35, '#9ad'); g.addColorStop(1, '#246');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(ball.x, ball.y, r, 0, 7); ctx.fill();
+}
+function draw() {
+  if (!W) return;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#ead6ad'; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(view, 0, 0, W, H);
+  const r = mode === 'play' && geo ? geo.r : LEVELS[$('level').value].r * S;
+  if (mode === 'play') {
+    blocks.forEach(b => {
+      ctx.fillStyle = '#7a4f2a'; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#3d2612'; ctx.lineWidth = 2; ctx.strokeRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2);
+    });
+    pits.forEach(p => hole(p.x, p.y, geo.pitR, null));
+  }
+  if (goal) { hole(goal.x, goal.y, r * 1.45, '#ff8c00'); label('G', goal.x, goal.y - r * 1.45 - 9, '#c25e00'); }
+  if (start) {
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = '#2e8b57'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(start.x, start.y, r * 1.5, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+    label('S', start.x, start.y - r * 1.5 - 9, '#2e8b57');
+  }
+  if (mode === 'play') {
+    bars.forEach(b => {
+      ctx.fillStyle = '#c0392b'; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#7b1f15'; ctx.lineWidth = 2; ctx.strokeRect(b.x, b.y, b.w, b.h);
+    });
+    if (ball) drawBall();
+  }
+  ctx.strokeStyle = '#5a3a1e'; ctx.lineWidth = 4; ctx.strokeRect(2, 2, W - 4, H - 4);
+  if (paused) {
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('画面を縦向きに戻してください', W / 2, H / 2);
+  }
+}
+
+// ---------- 毎コマの処理 ----------
+function loop(t) {
+  const dt = Math.min(.033, Math.max(0, (t - lastT) / 1000)); lastT = t;
+  paused = mode === 'play' && tilt.ok && innerWidth > innerHeight;
+  if (mode === 'play' && !paused && ball) {
+    if (state === 'play') { elapsed += dt; physics(dt); }
+    else {
+      moveBars(dt);
+      if (state === 'falling' || state === 'goalIn') {
+        if (state === 'falling') elapsed += dt;
+        anim += dt;
+        const k = Math.min(1, dt * 12);
+        ball.x += (dropAt.x - ball.x) * k; ball.y += (dropAt.y - ball.y) * k;
+        ball.sc = Math.max(0, 1 - anim / .45);
+        if (anim > .45) { if (state === 'falling') { ball = newBall(); state = 'play'; } else finish(); }
+      }
+    }
+    $('hud').textContent = `${elapsed.toFixed(1)}秒　落ちた${falls}回　${lv.name}`;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(() => { setup(); requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
